@@ -1,0 +1,117 @@
+name: Build Arthur Firmware
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build.yml', '*.py']
+  workflow_dispatch:
+    inputs:
+      openclash:
+        description: Include OpenClash
+        type: boolean
+        default: true
+      passwall2:
+        description: Include PassWall2
+        type: boolean
+        default: true
+      homeproxy:
+        description: Include HomeProxy
+        type: boolean
+        default: true
+      ipv6:
+        description: Include IPv6
+        type: boolean
+        default: true
+      upnp:
+        description: Include UPnP
+        type: boolean
+        default: true
+      ddns:
+        description: Include DDNS
+        type: boolean
+        default: true
+      samba:
+        description: Include SMB file sharing
+        type: boolean
+        default: true
+permissions:
+  contents: write
+concurrency:
+  group: arthur-firmware
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      SOURCE_COMMIT: fd7cdeefc0d62a22a3d8b89d6aed42c42e18a503
+      CI_COMMIT: 5a77a388c8fe91c894f3e97618e9f997b57c4fba
+      OPT_OPENCLASH: ${{ github.event_name == 'push' && 'true' || inputs.openclash && 'true' || 'false' }}
+      OPT_PASSWALL2: ${{ github.event_name == 'push' && 'true' || inputs.passwall2 && 'true' || 'false' }}
+      OPT_HOMEPROXY: ${{ github.event_name == 'push' && 'true' || inputs.homeproxy && 'true' || 'false' }}
+      OPT_IPV6: ${{ github.event_name == 'push' && 'true' || inputs.ipv6 && 'true' || 'false' }}
+      OPT_UPNP: ${{ github.event_name == 'push' && 'true' || inputs.upnp && 'true' || 'false' }}
+      OPT_DDNS: ${{ github.event_name == 'push' && 'true' || inputs.ddns && 'true' || 'false' }}
+      OPT_SAMBA: ${{ github.event_name == 'push' && 'true' || inputs.samba && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare Linux build environment
+        run: |
+          curl --fail --location --retry 3 https://build-scripts.immortalwrt.org/init_build_environment.sh -o /tmp/init-build-environment.sh
+          sudo bash /tmp/init-build-environment.sh
+          sudo apt-get update
+          sudo apt-get install -y dos2unix libfuse-dev python3
+          sudo mkdir -p /mnt/arthur-build
+          sudo chown "$USER:$USER" /mnt/arthur-build
+          df -h /mnt
+      - name: Fetch pinned source and upstream customization scripts
+        run: |
+          git clone --depth 1 --branch owrt https://github.com/VIKINGYFY/immortalwrt.git /mnt/arthur-build/wrt
+          git -C /mnt/arthur-build/wrt fetch --depth 1 origin "$SOURCE_COMMIT"
+          git -C /mnt/arthur-build/wrt checkout --detach "$SOURCE_COMMIT"
+          git clone --depth 1 https://github.com/VIKINGYFY/OpenWRT-CI.git /mnt/arthur-build/ci
+          git -C /mnt/arthur-build/ci fetch --depth 1 origin "$CI_COMMIT"
+          git -C /mnt/arthur-build/ci checkout --detach "$CI_COMMIT"
+          mkdir -p build-output
+          sha256sum /tmp/init-build-environment.sh > build-output/bootstrap.sha256
+          printf 'source=%s\nci=%s\n' "$SOURCE_COMMIT" "$CI_COMMIT" > build-output/source-commits.txt
+          sed -i '/^src-git video /d; /^src-git pon_drivers /d; /^src-git pon_userspace /d' /mnt/arthur-build/wrt/feeds.conf.default
+      - name: Prepare feeds and proxy packages
+        run: |
+          set -o pipefail
+          cd /mnt/arthur-build/wrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          python3 "$GITHUB_WORKSPACE/prepare.py" /mnt/arthur-build/ci/Scripts/Packages.sh
+          bash /mnt/arthur-build/ci/Scripts/Packages.sh 2>&1 | tee "$GITHUB_WORKSPACE/build-output/package-setup.log"
+          bash /mnt/arthur-build/ci/Scripts/Handles.sh
+          python3 "$GITHUB_WORKSPACE/configure.py" .config
+          make defconfig
+          python3 "$GITHUB_WORKSPACE/configure.py" .config --verify
+          cp .config "$GITHUB_WORKSPACE/build-output/firmware.config"
+          ./scripts/diffconfig.sh > "$GITHUB_WORKSPACE/build-output/config.diff"
+          git log -1 --format=fuller > "$GITHUB_WORKSPACE/build-output/source-commit.txt"
+          cp feeds.conf.default "$GITHUB_WORKSPACE/build-output/feeds.conf"
+      - name: Download source archives
+        run: |
+          set -o pipefail
+          cd /mnt/arthur-build/wrt
+          make download -j8 2>&1 | tee "$GITHUB_WORKSPACE/build-output/download.log"
+      - name: Compile firmware
+        run: |
+          set -o pipefail
+          cd /mnt/arthur-build/wrt
+          make -j$(nproc) 2>&1 | tee "$GITHUB_WORKSPACE/build-output/build.log" || make -j1 V=s 2>&1 | tee -a "$GITHUB_WORKSPACE/build-output/build.log"
+      - name: Verify board, selected packages and partition sizes
+        run: python3 verify_images.py /mnt/arthur-build/wrt/bin/targets/qualcommax/ipq60xx build-output
+      - name: Upload build logs and artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arthur-build-${{ github.run_number }}
+          path: build-output/
+          retention-days: 30
+      - name: Publish verified firmware
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "arthur-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}" build-output/*.bin build-output/*.config build-output/*.json build-output/*.manifest build-output/*.buildinfo build-output/SHA256SUMS build-output/source-commits.txt build-output/third-party-sources.txt --repo "$GITHUB_REPOSITORY" --title "Arthur firmware build ${GITHUB_RUN_NUMBER}" --notes-file build-output/RESULT.txt
